@@ -2,11 +2,49 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
+
+	"github.com/js-env-finder/internal/command"
 )
+
+type CommandFlags struct {
+	workerCount int
+	paths       []string
+	exclude     []string
+}
+
+func getFlags() CommandFlags {
+	c := CommandFlags{
+		workerCount: 0,
+		paths:       []string{"."},
+		exclude:     []string{},
+	}
+
+	// worker count, default count is 4
+	workerCount := flag.Int("wc", 4, "specifies how much parallel worker threads to use to find env. variables. DEFAULT: 4")
+
+	var excludeArr command.StringArray
+	flag.Var(&excludeArr, "exclude", "paths to be excluded during the search")
+
+	// parse flags
+	flag.Parse()
+
+	c.workerCount = *workerCount
+
+	c.exclude = excludeArr
+
+	// paths: using flag.Args
+	if len(flag.Args()) != 0 {
+		c.paths = flag.Args()
+	}
+
+	return c
+}
 
 func check(e error) {
 	if e != nil {
@@ -15,7 +53,7 @@ func check(e error) {
 }
 
 func isWhitespace(charByte byte) bool {
-	const spaces = " \n\t"
+	const spaces = " \n\t" // whitespace, new line, tab
 	spaceFound := false
 	for i := 0; i < len(spaces); i++ {
 		if spaces[i] == charByte {
@@ -32,8 +70,7 @@ func isEndToken(tokenChecker *regexp.Regexp, charByte byte) bool {
 
 func findFromSingleFile(id int, filePaths <-chan string, results chan<- []string) {
 	for filePath := range filePaths {
-		// filePath := <-filePaths
-		fmt.Printf("%d Worker started: %s\n", id, filePath)
+		fmt.Printf("Worker %d processing file: %s\n", id, filePath)
 		js, err := os.Open(filePath)
 		check(err)
 
@@ -47,7 +84,6 @@ func findFromSingleFile(id int, filePaths <-chan string, results chan<- []string
 		temp := make([]byte, 0)
 
 		for {
-			// line, err := reader.ReadString('\n')
 			block := make([]byte, 1)
 			_, err := reader.Read(block)
 			if err != nil {
@@ -59,7 +95,7 @@ func findFromSingleFile(id int, filePaths <-chan string, results chan<- []string
 				continue
 			}
 
-			// check if there any whitespaces between process.ev. & environment variable name
+			// check if there any whitespaces between process.env. & environment variable name
 			if index > len(processEnvString)-1 {
 				if !isConsuming && !isWhitespace(block[0]) {
 					// start of consuming
@@ -81,37 +117,82 @@ func findFromSingleFile(id int, filePaths <-chan string, results chan<- []string
 				}
 			}
 		}
-		fmt.Printf("%d Worker ended: %s\n", id, filePath)
+		// fmt.Printf("%d Worker ended: %s\n", id, filePath)
 		results <- consumer
 	}
 }
 
+func getFilePaths(path string, excludes []string) chan string {
+	ch := make(chan string)
+
+	go func() {
+		defer close(ch)
+		fileFormatChecker, _ := regexp.Compile(`^.*\.(js|jsx|ts|tsx)$`)
+
+		err := filepath.WalkDir(path, func(subpath string, entry os.DirEntry, err error) error {
+			if err != nil {
+				fmt.Printf("Error during accessing %v, maybe the path does not exist(Error: %v)\n", subpath, err)
+				return nil
+			}
+			// TODO glob check
+			// for _, ex := range excludes {
+			// 	if ex == info.Name() {
+			// 		fmt.Printf("Skipping the path '%v', since it is in the exclusion list\n", info.Name())
+			// 		return filepath.SkipDir
+			// 	}
+			// }
+
+			if !entry.IsDir() && fileFormatChecker.MatchString(entry.Name()) {
+				ch <- subpath
+			}
+
+			return nil
+		})
+		check(err)
+	}()
+
+	return ch
+}
+
 func main() {
-	filePaths := []string{"samples/index.js", "samples/index.js", "samples/index.js"}
-	filePathChannel := make(chan string, 4)
-	results := make(chan []string, 4)
+	cFlags := getFlags()
+	WORKER_COUNT := cFlags.workerCount
+	EXCLUDES := cFlags.exclude
 
-	for w := 1; w <= 2; w++ {
-		go findFromSingleFile(w, filePathChannel, results)
+	fmt.Printf("Number of parallel workers: %d\n", WORKER_COUNT)
+
+	paths := cFlags.paths
+	filePathChannel := make(chan string, WORKER_COUNT)
+	resultChannel := make(chan []string, WORKER_COUNT)
+	numFound := 0
+
+	for w := 1; w <= WORKER_COUNT; w++ {
+		go findFromSingleFile(w, filePathChannel, resultChannel)
 	}
 
-	for i := 0; i <= len(filePaths)-1; i++ {
-		filePathChannel <- filePaths[i]
+	for _, path := range paths {
+		fmt.Printf("Working on a path: %s\n", path)
+		pathInfo, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			fmt.Printf("Path %s does not exist\n", path)
+			continue
+		}
+		if !pathInfo.IsDir() {
+			filePathChannel <- path
+			continue
+		}
+		// generator pattern
+		for filePath := range getFilePaths(path, EXCLUDES) {
+			numFound++
+			filePathChannel <- filePath
+		}
 	}
-	// for _, filePath := range filePaths {
-	// 	filePathChannel <- filePath
-	// }
-	// close(filePathChannel)
+	close(filePathChannel)
 
 	all := make([]string, 0)
-	// for result := range results {
-	// 	fmt.Println(len(results))
-	// 	fmt.Println((result))
-	// 	all = append(all, result...)
-	// }
-	for j := 1; j <= len(filePaths); j++ {
-		result := <-results
-		fmt.Println(result)
+
+	for j := 1; j <= numFound; j++ {
+		result := <-resultChannel
 		all = append(all, result...)
 	}
 
